@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"time"
 
 	"github.com/akamensky/argparse"
-	"golang.org/x/net/websocket"
+	"github.com/gorilla/websocket"
 )
 
 // DebugData is JSON structure returned by Chromium
@@ -32,7 +33,7 @@ type WebsocketResponseRoot struct {
 	Result WebsocketResponseNested `json:"result"`
 }
 
-// WebsocketResponseNested is the object within the the raw response from Chromium websocket
+// WebsocketResponseNested is the object within the raw response from Chromium websocket
 type WebsocketResponseNested struct {
 	Cookies []Cookie `json:"cookies"`
 }
@@ -63,160 +64,104 @@ type LightCookie struct {
 
 // GetDebugData interacts with Chromium debug port to obtain the JSON response of open tabs/installed extensions
 func GetDebugData(debugPort string) []DebugData {
-
-	// Create debugURL from user input
 	var debugURL = "http://localhost:" + debugPort + "/json"
-
-	// Make GET request
 	resp, err := http.Get(debugURL)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Failed to get debug data: %v", err)
 	}
+	defer resp.Body.Close()
 
-	// Read GET response
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Failed to read response body: %v", err)
 	}
 
-	// Unmarshal JSON response
 	var debugList []DebugData
-	err = json.Unmarshal(body, &debugList)
-	if err != nil {
-		log.Fatalln(err)
+	if err := json.Unmarshal(body, &debugList); err != nil {
+		log.Fatalf("Failed to unmarshal JSON: %v", err)
 	}
 
 	return debugList
 }
 
-// PrintDebugData takes the JSON response from Chromium and prints open tabs and  installed extensions
+// PrintDebugData takes the JSON response from Chromium and prints open tabs and installed extensions
 func PrintDebugData(debugList []DebugData, grep string) {
-
-	// Check length of grep to see if filtering was requested
-	var grepFlag = false
-
-	if len(grep) > 0 {
-		grepFlag = true
-	}
+	grepFlag := len(grep) > 0
 
 	for _, value := range debugList {
-		if grepFlag {
-			if strings.Contains(value.Title, grep) || strings.Contains(value.URL, grep) {
-				fmt.Printf("Title: %s\n", value.Title)
-				fmt.Printf("Type: %s\n", value.PageType)
-				fmt.Printf("URL: %s\n", value.URL)
-				fmt.Printf("WebSocket Debugger URL: %s\n\n", value.WebSocketDebuggerURL)
-			}
-		} else {
+		if !grepFlag || strings.Contains(value.Title, grep) || strings.Contains(value.URL, grep) {
 			fmt.Printf("Title: %s\n", value.Title)
 			fmt.Printf("Type: %s\n", value.PageType)
 			fmt.Printf("URL: %s\n", value.URL)
 			fmt.Printf("WebSocket Debugger URL: %s\n\n", value.WebSocketDebuggerURL)
 		}
-
 	}
 }
 
 // DumpCookies interacts with the webSocketDebuggerUrl to obtain Chromium cookies
 func DumpCookies(debugList []DebugData, format string, grep string) {
+	grepFlag := len(grep) > 0
+	websocketURL := debugList[0].WebSocketDebuggerURL
 
-	// Check length of grep to see if filtering was requested
-	var grepFlag = false
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	if len(grep) > 0 {
-		grepFlag = true
-	}
-
-	// Obtain WebSocketDebuggerURL from DebugData list
-	var websocketURL = debugList[0].WebSocketDebuggerURL
-
-	// Connect to websocket
-	ws, err := websocket.Dial(websocketURL, "", "http://localhost/")
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, websocketURL, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	// Set read limit
+	conn.SetReadLimit(10 * 1024 * 1024) // 10 MB
+
+	message := `{"id": 1, "method":"Network.getAllCookies"}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		log.Fatalf("Failed to send message: %v", err)
 	}
 
-	// Send message to websocket
-	var message = "{\"id\": 1, \"method\":\"Network.getAllCookies\"}"
-	websocket.Message.Send(ws, message)
+	_, rawResponse, err := conn.ReadMessage()
+	if err != nil {
+		log.Fatalf("Failed to read response: %v", err)
+	}
 
-	// Get cookies from websocket
-	var rawResponse []byte
-	websocket.Message.Receive(ws, &rawResponse)
-
-	// Unmarshal JSON response
 	var websocketResponseRoot WebsocketResponseRoot
-	err = json.Unmarshal(rawResponse, &websocketResponseRoot)
-	if err != nil {
-		log.Fatalln(err)
+	if err := json.Unmarshal(rawResponse, &websocketResponseRoot); err != nil {
+		log.Fatalf("Failed to unmarshal JSON: %v", err)
 	}
 
-	// Print cookies in raw format as returned by Chromium websocket
 	if format == "raw" {
 		fmt.Printf("%s\n", rawResponse)
-		os.Exit(0)
+		return
 	}
 
-	// Print cookies in JSON format with modified expiration date
-	// Additionally, only include name, value, domain, path, and expirationDate
 	if format == "modified" {
-		lightCookieList := []LightCookie{}
+		var lightCookieList []LightCookie
 
 		for _, value := range websocketResponseRoot.Result.Cookies {
-			if grepFlag {
-				if strings.Contains(value.Name, grep) || strings.Contains(value.Domain, grep) {
-					// Turns Cookie into LightCookie with modified expires field
-					var lightCookie LightCookie
-
-					lightCookie.Name = value.Name
-					lightCookie.Value = value.Value
-					lightCookie.Domain = value.Domain
-					lightCookie.Path = value.Path
-					lightCookie.Expires = (float64)(time.Now().Unix() + (10 * 365 * 24 * 60 * 60))
-
-					lightCookieList = append(lightCookieList, lightCookie)
+			if !grepFlag || strings.Contains(value.Name, grep) || strings.Contains(value.Domain, grep) {
+				lightCookie := LightCookie{
+					Name:    value.Name,
+					Value:   value.Value,
+					Domain:  value.Domain,
+					Path:    value.Path,
+					Expires: float64(time.Now().Unix() + (10 * 365 * 24 * 60 * 60)),
 				}
-			} else {
-				// Turns Cookie into LightCookie with modified expires field
-				var lightCookie LightCookie
-
-				lightCookie.Name = value.Name
-				lightCookie.Value = value.Value
-				lightCookie.Domain = value.Domain
-				lightCookie.Path = value.Path
-				lightCookie.Expires = (float64)(time.Now().Unix() + (10 * 365 * 24 * 60 * 60))
 
 				lightCookieList = append(lightCookieList, lightCookie)
 			}
-
 		}
 
 		lightCookieJSON, err := json.Marshal(lightCookieList)
 		if err != nil {
-			log.Fatalln(err)
+			log.Fatalf("Failed to marshal JSON: %v", err)
 		}
 		fmt.Printf("%s\n", lightCookieJSON)
-		os.Exit(0)
+		return
 	}
 
-	// Default to printing cookies in human format
 	for _, value := range websocketResponseRoot.Result.Cookies {
-		if grepFlag {
-			if strings.Contains(value.Name, grep) || strings.Contains(value.Domain, grep) {
-				fmt.Printf("name: %s\n", value.Name)
-				fmt.Printf("value: %s\n", value.Value)
-				fmt.Printf("domain: %s\n", value.Domain)
-				fmt.Printf("path: %s\n", value.Path)
-				fmt.Printf("expires: %f\n", value.Expires)
-				fmt.Printf("size: %d\n", value.Size)
-				fmt.Printf("httpOnly: %t\n", value.HTTPOnly)
-				fmt.Printf("secure: %t\n", value.Secure)
-				fmt.Printf("session: %t\n", value.Session)
-				fmt.Printf("sameSite: %s\n", value.SameSite)
-				fmt.Printf("priority: %s\n\n", value.Priority)
-			}
-
-		} else {
+		if !grepFlag || strings.Contains(value.Name, grep) || strings.Contains(value.Domain, grep) {
 			fmt.Printf("name: %s\n", value.Name)
 			fmt.Printf("value: %s\n", value.Value)
 			fmt.Printf("domain: %s\n", value.Domain)
@@ -229,74 +174,77 @@ func DumpCookies(debugList []DebugData, format string, grep string) {
 			fmt.Printf("sameSite: %s\n", value.SameSite)
 			fmt.Printf("priority: %s\n\n", value.Priority)
 		}
-
 	}
 }
 
-func ClearCookies(debugList []DebugData){
-	var websocketURL = debugList[0].WebSocketDebuggerURL
+func ClearCookies(debugList []DebugData) {
+	websocketURL := debugList[0].WebSocketDebuggerURL
 
-	// Connect to websocket
-	ws, err := websocket.Dial(websocketURL, "", "http://localhost/")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, websocketURL, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to dial websocket: %v", err)
 	}
+	defer conn.Close()
 
-	// Send message to websocket
-	var message = "{\"id\": 1, \"method\": \"Network.clearBrowserCookies\"}"
-	websocket.Message.Send(ws, message)
+	// Set read limit
+	conn.SetReadLimit(10 * 1024 * 1024) // 10 MB
 
+	message := `{"id": 1, "method": "Network.clearBrowserCookies"}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		log.Fatalf("Failed to send message: %v", err)
+	}
 }
 
-func LoadCookies(debugList []DebugData, load string){
-	// Read cookies
-	content, err := ioutil.ReadFile(load)
+func LoadCookies(debugList []DebugData, load string) {
+	content, err := os.ReadFile(load)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to read file: %v", err)
 	}
 
-	var websocketURL = debugList[0].WebSocketDebuggerURL
+	websocketURL := debugList[0].WebSocketDebuggerURL
 
-	// Connect to websocket
-	ws, err := websocket.Dial(websocketURL, "", "http://localhost/")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, websocketURL, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to dial websocket: %v", err)
 	}
+	defer conn.Close()
 
-	// Send message to websocket
-	var message = fmt.Sprintf("{\"id\": 1, \"method\":\"Network.setCookies\", \"params\":{\"cookies\":%s}}", content)
-	websocket.Message.Send(ws, message)
+	// Set read limit
+	conn.SetReadLimit(10 * 1024 * 1024) // 10 MB
+
+	message := fmt.Sprintf(`{"id": 1, "method":"Network.setCookies", "params":{"cookies":%s}}`, content)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		log.Fatalf("Failed to send message: %v", err)
+	}
 }
 
 func main() {
+	parser := argparse.NewParser("WhiteChocolateMacademia", "Interact with Chromium-based browsers' debug port to view open tabs, installed extensions, and cookies")
 
-	// Create new parser object
-	parser := argparse.NewParser("WhiteChocolateMacademia", "Interact with Chromium-based browsers' debug port to view open tabs, installed extensions, and cookies (https://github.com/slyd0g/WhiteChocolateMacademiaNut)")
+	debugPort := parser.String("p", "port", &argparse.Options{Required: true, Help: "{REQUIRED} - Debug port"})
+	dump := parser.String("d", "dump", &argparse.Options{Required: false, Help: "{ pages || cookies } - Dump open tabs/extensions or cookies"})
+	format := parser.String("f", "format", &argparse.Options{Required: false, Help: "{ raw || human || modified } - Format when dumping cookies"})
+	grep := parser.String("g", "grep", &argparse.Options{Required: false, Help: "Narrow scope of dumping to specific name/domain"})
+	load := parser.String("l", "load", &argparse.Options{Required: false, Help: "File name for cookies to load into browser"})
+	clear := parser.String("c", "clear", &argparse.Options{Required: false, Help: "Clear cookies before loading new cookies"})
 
-	// Create arguments
-	var debugPort *string = parser.String("p", "port", &argparse.Options{Required: true, Help: "{REQUIRED} - Debug port"})
-	var dump *string = parser.String("d", "dump", &argparse.Options{Required: false, Help: "{ pages || cookies } - Dump open tabs/extensions or cookies"})
-	var format *string = parser.String("f", "format", &argparse.Options{Required: false, Help: "{ raw || human || modified } - Format when dumping cookies"})
-	var grep *string = parser.String("g", "grep", &argparse.Options{Required: false, Help: "Narrow scope of dumping to specific name/domain"})
-	var load *string = parser.String("l", "load", &argparse.Options{Required: false, Help: "File name for cookies to load into browser"})
-	var clear *string = parser.String("c", "clear", &argparse.Options{Required: false, Help: "Clear cookies before loading new cookies"})
-	// Parse arguments
 	err := parser.Parse(os.Args)
 	if err != nil {
-		// In case of error print error and print usage
-		// This can also be done by passing -h or --help flags
 		fmt.Printf("%s\n", parser.Usage(err))
 		os.Exit(1)
 	}
 
 	if *dump != "" {
-		// Enumerate open tabs and installed extensions
 		if *dump == "pages" {
 			debugList := GetDebugData(*debugPort)
 			PrintDebugData(debugList, *grep)
 		}
-
-		// Dump cookies
 		if *dump == "cookies" {
 			debugList := GetDebugData(*debugPort)
 			DumpCookies(debugList, *format, *grep)
